@@ -259,6 +259,68 @@ class GKBService:
             records = await result.data()
             return records
 
+    async def get_student_confusions(
+        self, student_id: int, concept_key: str, category_key: str
+    ) -> list[str]:
+        """
+        Returns concept keys (bare, without category prefix) that this student
+        confused with concept_key, ordered by CONFUSION edge weight descending.
+        Uses the concept-level CONFUSION edges filtered to concepts that share
+        a T1_SCORE edge from this student (i.e. concepts the student has been
+        tested on in the same category session).
+        """
+        full_concept_key = f"{category_key}/{concept_key}"
+        async with self._driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (s:Student { student_id: $sid })-[:T1_SCORE]->(correct:Concept { concept_key: $ckey })
+                MATCH (correct)-[r:CONFUSION]->(confused:Concept)
+                RETURN confused.concept_key AS full_key, r.weight AS weight
+                ORDER BY r.weight DESC
+                LIMIT 2
+                """,
+                sid=student_id,
+                ckey=full_concept_key,
+            )
+            records = await result.data()
+            # Strip category prefix: "fruits/banana" → "banana"
+            return [rec["full_key"].split("/")[-1] for rec in records]
+
+    async def get_student_category_confusions(
+        self, student_id: int, category_key: str
+    ) -> list[dict]:
+        """
+        Returns all CONFUSION edges for this student across an entire category.
+        Each record: { correct_key, confused_key, weight }
+        Ordered by weight descending.
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (s:Student { student_id: $sid })-[:T1_SCORE]->(correct:Concept)
+                WHERE correct.category_key = $catkey
+                MATCH (correct)-[r:CONFUSION]->(confused:Concept)
+                WHERE confused.category_key = $catkey
+                RETURN
+                    correct.concept_key  AS correct_key,
+                    confused.concept_key AS confused_key,
+                    r.weight             AS weight
+                ORDER BY r.weight DESC
+                """,
+                sid=student_id,
+                catkey=category_key,
+            )
+            return await result.data()
+
+    async def record_adaptive_confusions(
+        self, correct_key: str, category_key: str, confused_with: list[str]
+    ):
+        """Increment CONFUSION edges for adaptive quiz wrong answers."""
+        for confused_key in confused_with:
+            full_correct  = f"{category_key}/{correct_key}"
+            full_confused = f"{category_key}/{confused_key}"
+            await self._increment_confusion_edge(full_correct, full_confused)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
