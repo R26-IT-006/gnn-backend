@@ -166,7 +166,8 @@ class GKBService:
                 ON CREATE SET s.student_key = $skey, s.full_name = $sname, s.created_at = $now
                 ON MATCH SET  s.full_name = CASE WHEN $sname IS NOT NULL THEN $sname ELSE s.full_name END
                 WITH s
-                MATCH (c:Concept { concept_key: $ckey })
+                MERGE (c:Concept { concept_key: $ckey })
+                ON CREATE SET c.category_key = $catkey, c.created_at = $now
                 MERGE (s)-[r:T1_SCORE]->(c)
                 ON CREATE SET
                     r.score         = $score,
@@ -185,6 +186,7 @@ class GKBService:
                 skey=f"student/{student_id}",
                 sname=full_name,
                 ckey=full_concept_key,
+                catkey=category_key,
                 score=score,
                 attempts=attempt_count,
                 passed=passed,
@@ -208,8 +210,10 @@ class GKBService:
         async with self._driver.session() as session:
             await session.run(
                 """
-                MATCH (a:Concept { concept_key: $akey })
-                MATCH (b:Concept { concept_key: $bkey })
+                MERGE (a:Concept { concept_key: $akey })
+                ON CREATE SET a.category_key = split($akey, '/')[0], a.created_at = $now
+                MERGE (b:Concept { concept_key: $bkey })
+                ON CREATE SET b.category_key = split($bkey, '/')[0], b.created_at = $now
                 MERGE (a)-[r:CONFUSION]->(b)
                 ON CREATE SET r.weight = 1, r.updated_at = $now
                 ON MATCH  SET r.weight = r.weight + 1, r.updated_at = $now
@@ -300,7 +304,7 @@ class GKBService:
                 MATCH (s:Student { student_id: $sid })-[:T1_SCORE]->(correct:Concept)
                 WHERE correct.category_key = $catkey
                 MATCH (correct)-[r:CONFUSION]->(confused:Concept)
-                WHERE confused.category_key = $catkey
+                WHERE confused.concept_key STARTS WITH ($catkey + '/')
                 RETURN
                     correct.concept_key  AS correct_key,
                     confused.concept_key AS confused_key,
@@ -320,6 +324,128 @@ class GKBService:
             full_correct  = f"{category_key}/{correct_key}"
             full_confused = f"{category_key}/{confused_key}"
             await self._increment_confusion_edge(full_correct, full_confused)
+
+    # ─── Tier 2 edge helpers ─────────────────────────────────────────────────────
+
+    async def upsert_t2_engagement(
+        self,
+        student_id: int,
+        concept_key: str,
+        category_key: str,
+        tap_count: int,
+        time_spent_ms: int,
+        full_name: str = None,
+    ) -> dict:
+        full_concept_key = f"{category_key}/{concept_key}"
+        async with self._driver.session() as session:
+            result = await session.run(
+                """
+                MERGE (s:Student { student_id: $sid })
+                ON CREATE SET s.student_key = $skey, s.full_name = $sname, s.created_at = $now
+                ON MATCH SET  s.full_name = CASE WHEN $sname IS NOT NULL THEN $sname ELSE s.full_name END
+                WITH s
+                MATCH (c:Concept { concept_key: $ckey })
+                MERGE (s)-[r:T2_ENGAGEMENT]->(c)
+                ON CREATE SET
+                    r.tap_count     = $tap,
+                    r.time_spent_ms = $time,
+                    r.created_at    = $now,
+                    r.updated_at    = $now
+                ON MATCH SET
+                    r.tap_count     = $tap,
+                    r.time_spent_ms = $time,
+                    r.updated_at    = $now
+                RETURN r
+                """,
+                sid=student_id,
+                skey=f"student/{student_id}",
+                sname=full_name,
+                ckey=full_concept_key,
+                tap=tap_count,
+                time=time_spent_ms,
+                now=_now(),
+            )
+            record = await result.single()
+            return dict(record["r"]) if record else {}
+
+    async def upsert_t2_score(
+        self,
+        student_id: int,
+        concept_key: str,
+        category_key: str,
+        score: float,
+        attempt_count: int,
+        passed: bool,
+        confused_with: list[dict],
+        full_name: str = None,
+    ) -> dict:
+        """
+        confused_with: [{ "selected_key": "banana", "correct_key": "apple" }, ...]
+        Each wrong pair increments the T2_NAME_CONFUSION edge weight between the two concepts.
+        """
+        full_concept_key = f"{category_key}/{concept_key}"
+        async with self._driver.session() as session:
+            result = await session.run(
+                """
+                MERGE (s:Student { student_id: $sid })
+                ON CREATE SET s.student_key = $skey, s.full_name = $sname, s.created_at = $now
+                ON MATCH SET  s.full_name = CASE WHEN $sname IS NOT NULL THEN $sname ELSE s.full_name END
+                WITH s
+                MERGE (c:Concept { concept_key: $ckey })
+                ON CREATE SET c.category_key = $catkey, c.created_at = $now
+                MERGE (s)-[r:T2_SCORE]->(c)
+                ON CREATE SET
+                    r.score         = $score,
+                    r.attempt_count = $attempts,
+                    r.passed        = $passed,
+                    r.created_at    = $now,
+                    r.updated_at    = $now
+                ON MATCH SET
+                    r.score         = $score,
+                    r.attempt_count = $attempts,
+                    r.passed        = $passed,
+                    r.updated_at    = $now
+                RETURN r
+                """,
+                sid=student_id,
+                skey=f"student/{student_id}",
+                sname=full_name,
+                ckey=full_concept_key,
+                catkey=category_key,
+                score=score,
+                attempts=attempt_count,
+                passed=passed,
+                now=_now(),
+            )
+            record = await result.single()
+            edge = dict(record["r"]) if record else {}
+
+        for confusion in confused_with:
+            correct_key_full  = f"{category_key}/{confusion['correct_key']}"
+            selected_key_full = f"{category_key}/{confusion['selected_key']}"
+            await self._increment_t2_name_confusion_edge(correct_key_full, selected_key_full)
+
+        return edge
+
+    async def _increment_t2_name_confusion_edge(
+        self, correct_key: str, confused_with_key: str
+    ):
+        """Increment weight on T2_NAME_CONFUSION edge: correct_concept→confused_name_concept."""
+        async with self._driver.session() as session:
+            await session.run(
+                """
+                MERGE (a:Concept { concept_key: $akey })
+                ON CREATE SET a.category_key = split($akey, '/')[0], a.created_at = $now
+                MERGE (b:Concept { concept_key: $bkey })
+                ON CREATE SET b.category_key = split($bkey, '/')[0], b.created_at = $now
+                MERGE (a)-[r:T2_NAME_CONFUSION]->(b)
+                ON CREATE SET r.weight = 1, r.updated_at = $now
+                ON MATCH  SET r.weight = r.weight + 1, r.updated_at = $now
+                """,
+                akey=correct_key,
+                bkey=confused_with_key,
+                now=_now(),
+            )
 
 
 def _now() -> str:

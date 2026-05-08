@@ -268,3 +268,53 @@ async def record_adaptive_confusion(body: AdaptiveConfusionRequest, request: Req
     gkb = request.app.state.gkb
     await gkb.record_adaptive_confusions(body.correct_key, body.category_key, body.confused_with)
     return {"recorded": len(body.confused_with)}
+
+
+class Tier2EngagementRequest(BaseModel):
+    student_id: int
+    concept_key: str
+    category_key: str
+    tap_count: int
+    time_spent_ms: int
+    full_name: Optional[str] = None
+
+
+class Tier2ScoreRequest(BaseModel):
+    student_id: int
+    concept_key: str
+    category_key: str
+    score: float
+    attempt_count: int
+    passed: bool
+    confused_with: list[ConfusionItem] = []
+    full_name: Optional[str] = None
+
+
+@router.post("/tier2/engagement")
+async def upsert_tier2_engagement(body: Tier2EngagementRequest, request: Request):
+    gkb = request.app.state.gkb
+    edge = await gkb.upsert_t2_engagement(
+        student_id=body.student_id,
+        concept_key=body.concept_key,
+        category_key=body.category_key,
+        tap_count=body.tap_count,
+        time_spent_ms=body.time_spent_ms,
+        full_name=body.full_name,
+    )
+    return {"edge": edge}
+
+
+@router.post("/tier2/score")
+async def upsert_tier2_score(body: Tier2ScoreRequest, request: Request):
+    gkb = request.app.state.gkb
+    edge = await gkb.upsert_t2_score(
+        student_id=body.student_id,
+        concept_key=body.concept_key,
+        category_key=body.category_key,
+        score=body.score,
+        attempt_count=body.attempt_count,
+        passed=body.passed,
+        confused_with=[c.model_dump() for c in body.confused_with],
+        full_name=body.full_name,
+    )
+    return {"edge": edge}
