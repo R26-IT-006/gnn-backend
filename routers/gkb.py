@@ -177,6 +177,27 @@ async def ensure_student(student_id: int, body: EnsureStudentRequest, request: R
     return {"node": node}
 
 
+@router.get("/student/{student_id}/distractors")
+async def get_distractors(
+    student_id: int,
+    request: Request,
+    category_key: str = "",
+    concept_key: str = "",
+    tier: int = 1,
+):
+    """
+    Returns up to 2 personalised distractor concept keys for a student + concept.
+    Tier 1 → queries CONFUSION edges; Tier 2 → queries T2_NAME_CONFUSION edges.
+    Returns empty list if no confusion data exists yet (caller falls back to sequential).
+    """
+    gkb = request.app.state.gkb
+    if tier == 2:
+        keys = await gkb.get_student_t2_confusions(student_id, concept_key, category_key)
+    else:
+        keys = await gkb.get_student_confusions(student_id, concept_key, category_key)
+    return {"distractors": keys}
+
+
 @router.post("/tier1/engagement")
 async def upsert_tier1_engagement(body: Tier1EngagementRequest, request: Request):
     gkb = request.app.state.gkb

@@ -267,28 +267,90 @@ class GKBService:
         self, student_id: int, concept_key: str, category_key: str
     ) -> list[str]:
         """
-        Returns concept keys (bare, without category prefix) that this student
-        confused with concept_key, ordered by CONFUSION edge weight descending.
-        Uses the concept-level CONFUSION edges filtered to concepts that share
-        a T1_SCORE edge from this student (i.e. concepts the student has been
-        tested on in the same category session).
+        Returns up to 2 concept keys (bare) that are easily confused with concept_key
+        by this student, ordered by combined CONFUSION edge weight descending.
+
+        Queries two directions so first-time quizzes also get personalised distractors:
+          FROM: student was tested on target and picked something else  (target→X)
+          TO:   student was tested on another concept and picked target (Z→target)
+                → Z looks similar to target, so Z is a good distractor
         """
         full_concept_key = f"{category_key}/{concept_key}"
         async with self._driver.session() as session:
-            result = await session.run(
+            # FROM direction — needs T1_SCORE→target (student already did target's quiz)
+            r1 = await session.run(
                 """
-                MATCH (s:Student { student_id: $sid })-[:T1_SCORE]->(correct:Concept { concept_key: $ckey })
-                MATCH (correct)-[r:CONFUSION]->(confused:Concept)
+                MATCH (s:Student { student_id: $sid })-[:T1_SCORE]->(target:Concept { concept_key: $ckey })
+                MATCH (target)-[r:CONFUSION]->(confused:Concept)
+                WHERE confused.concept_key <> $ckey
                 RETURN confused.concept_key AS full_key, r.weight AS weight
-                ORDER BY r.weight DESC
-                LIMIT 2
                 """,
                 sid=student_id,
                 ckey=full_concept_key,
             )
-            records = await result.data()
-            # Strip category prefix: "fruits/banana" → "banana"
-            return [rec["full_key"].split("/")[-1] for rec in records]
+            from_records = await r1.data()
+
+            # TO direction — needs T1_SCORE→other (student did other concept's quiz
+            # and picked target as the answer, so other and target look similar)
+            r2 = await session.run(
+                """
+                MATCH (s:Student { student_id: $sid })-[:T1_SCORE]->(other:Concept)-[r:CONFUSION]->(target:Concept { concept_key: $ckey })
+                WHERE other.concept_key <> $ckey
+                RETURN other.concept_key AS full_key, r.weight AS weight
+                """,
+                sid=student_id,
+                ckey=full_concept_key,
+            )
+            to_records = await r2.data()
+
+        combined: dict[str, int] = {}
+        for rec in from_records + to_records:
+            key = rec["full_key"]
+            combined[key] = combined.get(key, 0) + (rec["weight"] or 0)
+
+        sorted_keys = sorted(combined, key=lambda k: combined[k], reverse=True)
+        return [k.split("/")[-1] for k in sorted_keys[:2]]
+
+    async def get_student_t2_confusions(
+        self, student_id: int, concept_key: str, category_key: str
+    ) -> list[str]:
+        """
+        Returns up to 2 concept keys confused with concept_key in Tier 2 name-matching,
+        using bidirectional T2_NAME_CONFUSION edges so first-time T2 quizzes also get
+        personalised distractors.
+        """
+        full_concept_key = f"{category_key}/{concept_key}"
+        async with self._driver.session() as session:
+            r1 = await session.run(
+                """
+                MATCH (s:Student { student_id: $sid })-[:T2_SCORE]->(target:Concept { concept_key: $ckey })
+                MATCH (target)-[r:T2_NAME_CONFUSION]->(confused:Concept)
+                WHERE confused.concept_key <> $ckey
+                RETURN confused.concept_key AS full_key, r.weight AS weight
+                """,
+                sid=student_id,
+                ckey=full_concept_key,
+            )
+            from_records = await r1.data()
+
+            r2 = await session.run(
+                """
+                MATCH (s:Student { student_id: $sid })-[:T2_SCORE]->(other:Concept)-[r:T2_NAME_CONFUSION]->(target:Concept { concept_key: $ckey })
+                WHERE other.concept_key <> $ckey
+                RETURN other.concept_key AS full_key, r.weight AS weight
+                """,
+                sid=student_id,
+                ckey=full_concept_key,
+            )
+            to_records = await r2.data()
+
+        combined: dict[str, int] = {}
+        for rec in from_records + to_records:
+            key = rec["full_key"]
+            combined[key] = combined.get(key, 0) + (rec["weight"] or 0)
+
+        sorted_keys = sorted(combined, key=lambda k: combined[k], reverse=True)
+        return [k.split("/")[-1] for k in sorted_keys[:2]]
 
     async def get_student_category_confusions(
         self, student_id: int, category_key: str
